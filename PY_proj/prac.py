@@ -1,11 +1,15 @@
-from flask import Flask, jsonify, request, render_template
+from flask import Flask, jsonify, request, render_template, redirect, url_for, session
 from uuid import uuid4
 from time import time
 from hashlib import sha256
 from datetime import datetime
 import pytz
+from ecdsa import SigningKey, VerifyingKey, SECP256k1, BadSignatureError
+import os
+import json
 
 app = Flask(__name__)
+app.secret_key = 'your_secret_key'  # Replace with a secure key for session management
 
 class Blockchain:
     def __init__(self):
@@ -30,7 +34,6 @@ class Blockchain:
         self.chain.append(block)
         return block
 
-
     def add_transaction(self, sender, receiver, amount):
         self.current_transactions.append({
             'sender': sender,
@@ -38,7 +41,6 @@ class Blockchain:
             'amount': amount,
         })
         return self.last_block['index'] + 1
-
 
     @property
     def last_block(self):
@@ -55,29 +57,76 @@ class Blockchain:
         guess = f'{last_proof}{proof}'.encode()
         guess_hash = sha256(guess).hexdigest()
         return guess_hash[:1] == "0"
-        
+
+# Initialize blockchain
 blockchain = Blockchain()
 
+# User data storage for demonstration (in-memory)
+users = {}  # Key: username, Value: {'public_key': ..., 'private_key': ...}
 
-node_identifier = str(uuid4()).replace('-', '')
+# Helper function to generate wallet (public-private key pair)
+def generate_wallet():
+    private_key = SigningKey.generate(curve=SECP256k1)
+    public_key = private_key.get_verifying_key()
+    return private_key.to_pem().decode(), public_key.to_pem().decode()
 
+@app.route('/register', methods=['POST'])
+def register():
+    username = request.form.get('username')
+    if username in users:
+        return jsonify({'message': 'User already exists'}), 400
+    private_key, public_key = generate_wallet()
+    users[username] = {'public_key': public_key, 'private_key': private_key}
+    return jsonify({'message': 'User registered successfully', 'public_key': public_key}), 201
 
+@app.route('/login', methods=['POST'])
+def login():
+    username = request.form.get('username')
+    if username not in users:
+        return jsonify({'message': 'Invalid username'}), 401
+    session['username'] = username
+    return jsonify({'message': 'Logged in successfully'}), 200
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
+@app.route('/logout', methods=['GET'])
+def logout():
+    session.pop('username', None)
+    return jsonify({'message': 'Logged out successfully'}), 200
 
+@app.route('/create_transaction', methods=['POST'])
+def create_transaction():
+    if 'username' not in session:
+        return jsonify({'message': 'User not authenticated'}), 401
+    username = session['username']
+    sender = users[username]['public_key']
+    receiver = request.json.get('receiver')
+    amount = request.json.get('amount')
+    private_key_pem = users[username]['private_key']
+    
+    # Sign transaction
+    private_key = SigningKey.from_pem(private_key_pem)
+    transaction = {'sender': sender, 'receiver': receiver, 'amount': amount}
+    transaction_data = f"{sender}{receiver}{amount}".encode()
+    signature = private_key.sign(transaction_data).hex()
 
-@app.route('/transactions/new', methods=['POST'])
-def new_transaction():
-    values = request.get_json()
-    required = ['sender', 'receiver', 'amount']
-    if not all(k in values for k in required):
-        return jsonify({'message': 'Missing values'}), 400
+    blockchain.add_transaction(sender, receiver, amount)  # Add transaction to the blockchain
+    return jsonify({'message': 'Transaction created', 'signature': signature}), 201
 
-    index = blockchain.add_transaction(values['sender'], values['receiver'], values['amount'])
-    return jsonify({'message': f'Transaction will be added to Block {index}'}), 201
+@app.route('/verify_transaction', methods=['POST'])
+def verify_transaction():
+    sender_public_key_pem = request.json.get('sender_public_key')
+    transaction_data = request.json.get('transaction_data')
+    signature = bytes.fromhex(request.json.get('signature'))
+    
+    public_key = VerifyingKey.from_pem(sender_public_key_pem)
+    try:
+        public_key.verify(signature, transaction_data.encode())
+        return jsonify({'message': 'Transaction is valid'}), 200
+    except BadSignatureError:
+        return jsonify({'message': 'Invalid transaction signature'}), 400
 
 @app.route('/mine', methods=['GET'])
 def mine():
@@ -85,7 +134,7 @@ def mine():
     last_proof = last_block['proof']
     proof = blockchain.proof_of_work(last_proof)
 
-    blockchain.add_transaction(sender="0", receiver=node_identifier, amount=1)
+    blockchain.add_transaction(sender="0", receiver=session.get('username', 'Anonymous'), amount=1)
     
     previous_hash = blockchain.last_block['hash'] 
     block = blockchain.create_block(proof, previous_hash)
